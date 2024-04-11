@@ -1,0 +1,4 @@
+torch
+transformers
+fast-hadamard-transform
+tqdm

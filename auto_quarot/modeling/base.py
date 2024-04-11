@@ -1,12 +1,16 @@
+import math
 from typing import Dict, List, Literal
 
-import tqdm
-from ..utils import nested_attr, fuse_ln_linear, get_orthogonal_matrix
-from ..hadamard_utils import apply_exact_had_to_linear, matmul_hadU_cuda_had
+import fast_hadamard_transform
 import torch
+import tqdm
+
+from ..hadamard_utils import (apply_exact_had_to_linear, get_hadK,
+                              matmul_hadU_cuda, matmul_hadU_cuda_had)
+from ..utils import fuse_ln_linear, get_orthogonal_matrix, nested_attr
 
 
-class QuarotForCausalLM:
+class QuarotForCausalLM(torch.nn.Module):
     layers_block_name: str
     rope_function_name: str
     embeddings: List[str]
@@ -22,25 +26,39 @@ class QuarotForCausalLM:
     v_proj: str
 
     def __init__(self, model):
-        self.model = model
+        super().__init__()
+        self._model = model
+
+    @property
+    def model(self):
+        return self._model
+
+    @property
+    def quarot_config(self):
+        if getattr(self._model.config, "quarot_config", None) is None:
+            self._model.config.quarot_config = {
+                "fused": False,
+                "rotated": False,
+            }
+        return self._model.config.quarot_config
 
     def _get_rope_function_name(self):
-        return nested_attr(self.model, self.rope_function_name)
+        return nested_attr(self._model, self.rope_function_name)
 
     def _get_layers(self):
-        return nested_attr(self.model, self.layers_block_name)
+        return nested_attr(self._model, self.layers_block_name)
 
     def _get_embeddings(self) -> list[torch.nn.Module]:
-        return [nested_attr(self.model, embeddings) for embeddings in self.embeddings]
+        return [nested_attr(self._model, embeddings) for embeddings in self.embeddings]
 
     def _get_lm_head(self):
-        return nested_attr(self.model, self.lm_head)
+        return nested_attr(self._model, self.lm_head)
 
     def _get_pre_head_layernorm(self):
-        return nested_attr(self.model, self.pre_head_layernorm)
+        return nested_attr(self._model, self.pre_head_layernorm)
 
     def _get_mlp_bottleneck_size(self):
-        return nested_attr(self.model, self.mlp_bottleneck_size)
+        return nested_attr(self._model, self.mlp_bottleneck_size)
 
     def _rotate_embeddings(self, Q: torch.Tensor, device):
         # Rotate the embeddings.
@@ -107,6 +125,9 @@ class QuarotForCausalLM:
 
     @torch.inference_mode()
     def fuse_layer_norms(self):
+        if self.quarot_config["fused"]:
+            raise RuntimeError("layernorms are already fused")
+
         # Embedding fusion
         for W in self._get_embeddings():
             W_ = W.weight.data.double()
@@ -124,10 +145,17 @@ class QuarotForCausalLM:
 
         fuse_ln_linear(self._get_pre_head_layernorm(), [self._get_lm_head()])
 
+        self.quarot_config["fused"] = True
+
     @torch.inference_mode()
     def rotate_model(self, rotate_mode: Literal["random", "hadamard"], device):
-        Q = get_orthogonal_matrix(self.model.config.hidden_size, rotate_mode)
-        config = self.model.config
+        if self.quarot_config["rotated"]:
+            raise RuntimeError("model is already rotated")
+
+        Q = get_orthogonal_matrix(
+            self._model.config.hidden_size, rotate_mode, device=device
+        )
+        config = self._model.config
         num_heads = config.num_attention_heads
         model_dim = config.hidden_size
         head_dim = model_dim // num_heads
@@ -142,9 +170,70 @@ class QuarotForCausalLM:
             self._rotate_mlp_output(layers[idx], Q, device=device)
             self._rotate_ov_proj(layers[idx], num_heads, head_dim)
 
-        for param in self.model.parameters():
+        for param in self._model.parameters():
             if not param.is_contiguous():
                 param.data = param.data.contiguous()
+
+        self.quarot_config["rotated"] = True
+
+    def _add_pre_down_proj_hook(self, layer):
+        if getattr(layer, "_hadamard_hook", False):
+            return
+
+        def wrap(func):
+            def wrapper(x: torch.Tensor):
+                nonlocal had_K
+                had_K = had_K.to(x.device)
+                x = matmul_hadU_cuda(x, had_K, K)
+                return func(x)
+
+            return wrapper
+
+        had_K, K = get_hadK(self.model.config.intermediate_size)
+        layer.forward = wrap(layer.forward)
+        layer._hadamard_hook = True
+
+    def _add_pre_o_proj_hook(self, layer):
+        if getattr(layer, "_hadamard_hook", False):
+            return
+
+        def wrap(func):
+
+            def wrapper(x: torch.Tensor):
+                # todo: implement this in QAttention to avoid reshaping!
+                init_shape = x.shape
+                if K == 1:
+                    x = fast_hadamard_transform.hadamard_transform(
+                        x.reshape(-1, init_shape[-1] // had_dim, had_dim).transpose(
+                            1, 2
+                        ),
+                        scale=1 / math.sqrt(init_shape[-1] // had_dim),
+                    ).transpose(1, 2)
+                else:
+                    nonlocal had_K
+                    had_K = had_K.to(x.device)
+                    x = (
+                        had_K.to(x.dtype)
+                        @ x.reshape(-1, init_shape[-1] // had_dim, had_dim)
+                    ) / math.sqrt(init_shape[-1] // had_dim)
+                x = x.reshape(init_shape)
+
+                return func(x)
+
+            return wrapper
+
+        had_K, K = get_hadK(self.model.config.num_attention_heads)
+        had_dim = self.model.config.hidden_size // self.model.config.num_attention_heads
+        layer.forward = wrap(layer.forward)
+        layer._hadamard_hook = True
+
+    def add_pre_output_hooks(self):
+        layers = self._get_layers()
+        for layer in layers:
+            down_proj = nested_attr(layer, self.mlp_output)
+            self._add_pre_down_proj_hook(down_proj)
+            o_proj = nested_attr(layer, self.attention_output)
+            self._add_pre_o_proj_hook(o_proj)
 
 
 __all__ = ["QuarotForCausalLM"]
